@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import shutil
 
 import torch
@@ -52,10 +53,14 @@ QKV_SHARDS = ("to_q", "to_k", "to_v")
 BASE_ENTRIES = ("model_index.json", "scheduler", "processor", "vae")
 
 
-def quant_config(exclude_modules: list[str]) -> dict:
+# Headroom over the calibrated amax; a larger global scale only coarsens tiny FP8 block scales.
+INPUT_AMAX_MARGIN = 2.0
+
+
+def quant_config(exclude_modules: list[str], quant_algo: str = "W4A16_NVFP4") -> dict:
     return {
         "quant_method": "modelopt",
-        "quant_algo": "W4A16_NVFP4",
+        "quant_algo": quant_algo,
         "group_size": 16,
         "exclude_modules": sorted(exclude_modules),
     }
@@ -183,6 +188,19 @@ def convert_transformer(sd: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Te
     return out, _bf16_linears(out), worst_scale_err
 
 
+def add_input_scales(tensors: dict[str, torch.Tensor], input_amax: dict[str, float]) -> None:
+    """Add ModelOpt ``input_scale`` (amax / (448 * 6)) to every NVFP4 transformer linear, turning it W4A4.
+
+    ``input_amax`` is keyed by runtime prefix (``transformer.<module>``, fused ``to_qkv``).
+    """
+    for key in [k for k in tensors if k.endswith(".weight_scale_2")]:
+        module = key[: -len(".weight_scale_2")]
+        runtime = "transformer." + re.sub(r"\.attn\.to_[qkv]$", ".attn.to_qkv", module)
+        if runtime not in input_amax:
+            raise ValueError(f"no calibrated input amax for {runtime}")
+        tensors[f"{module}.input_scale"] = torch.tensor(input_amax[runtime] * INPUT_AMAX_MARGIN / (FP8_MAX * 6.0))
+
+
 _TE_RENAMES = (
     ("model.layers.", "model.language_model.layers."),
     ("model.embed_tokens.", "model.language_model.embed_tokens."),
@@ -242,6 +260,10 @@ def main() -> None:
     parser.add_argument("--transformer", required=True, help="ComfyUI NVFP4 diffusion model .safetensors")
     parser.add_argument("--text-encoder", required=True, help="ComfyUI NVFP4 Qwen3-VL text encoder .safetensors")
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--input-amax",
+        help="JSON from calibrate_nvfp4_input_amax.py; makes the transformer W4A4 (NVFP4) instead of W4A16",
+    )
     args = parser.parse_args()
 
     base, out = pathlib.Path(args.base), pathlib.Path(args.output)
@@ -254,8 +276,18 @@ def main() -> None:
             shutil.copy2(src, out / entry)
 
     tensors, exclude, worst = convert_transformer(_read(args.transformer))
+    transformer_algo = "W4A16_NVFP4"
+    if args.input_amax:
+        add_input_scales(tensors, json.loads(pathlib.Path(args.input_amax).read_text()))
+        transformer_algo = "NVFP4"
     _write_component(
-        out, base, "transformer", "diffusion_pytorch_model.safetensors", tensors, quant_config(exclude), None
+        out,
+        base,
+        "transformer",
+        "diffusion_pytorch_model.safetensors",
+        tensors,
+        quant_config(exclude, transformer_algo),
+        None,
     )
     print(
         f"transformer: {len(tensors)} tensors, {len(exclude)} BF16 linears, "

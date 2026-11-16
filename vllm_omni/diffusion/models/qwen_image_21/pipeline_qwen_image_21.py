@@ -430,6 +430,8 @@ class QwenImage21Pipeline(
                     prefix="text_encoder.",
                 )
             )
+        # The pipeline reads hidden states; vocabulary logits are never used.
+        self.text_encoder.lm_head = nn.Identity()
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKLQwenImage21.from_pretrained,
             model,
@@ -1696,5 +1698,5 @@ class QwenImage21Pipeline(
         return self._decode_latents(state.latents, height, width, output_type)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
+        loader = AutoWeightsLoader(self, ignore_unexpected_prefixes=["text_encoder.lm_head."])
         return loader.load_weights(weights)

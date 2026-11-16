@@ -168,3 +168,23 @@ def test_quant_config_selects_w4a16_and_excludes_runtime_prefixes():
     assert te.is_layer_excluded("lm_head")
     assert te.is_layer_excluded("model.language_model.layers.1.mlp.up_proj")
     assert not te.is_layer_excluded("model.language_model.layers.11.mlp.up_proj")
+
+
+def test_add_input_scales_uses_runtime_prefixes():
+    out, _, _ = conv.convert_transformer(_transformer_sd()[0])
+    amax = {
+        "transformer.transformer_blocks.0.attn.to_qkv": 3.0,
+        "transformer.transformer_blocks.0.img_mlp.gate_layer": 5.0,
+        "transformer.transformer_blocks.0.img_mlp.proj": 5.0,
+        "transformer.transformer_blocks.1.img_mlp.gate_layer": 7.0,
+        "transformer.transformer_blocks.1.img_mlp.proj": 7.0,
+    }
+    conv.add_input_scales(out, amax)
+
+    expected = 3.0 * conv.INPUT_AMAX_MARGIN / 2688
+    for s in ("to_q", "to_k", "to_v"):
+        assert out[f"transformer_blocks.0.attn.{s}.input_scale"].item() == pytest.approx(expected)
+    # BF16 (dequantized) shards get no input scale.
+    assert "transformer_blocks.1.attn.to_q.input_scale" not in out
+    with pytest.raises(ValueError, match="no calibrated input amax"):
+        conv.add_input_scales(out, {})
