@@ -66,7 +66,7 @@ from vllm_omni.diffusion.utils.size_utils import (
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.inputs.data import OmniTextPrompt
-from vllm_omni.quantization import resolve_component_quant_config
+from vllm_omni.quantization import build_quant_config, resolve_component_quant_config
 from vllm_omni.quantization.component_config import resolve_encoder_quant_config
 
 if TYPE_CHECKING:
@@ -122,6 +122,19 @@ def _resolve_text_encoder_quant_config(
     """
     resolved = resolve_component_quant_config(quant_config, "text_encoder")
     return resolve_encoder_quant_config(resolved)
+
+
+def _load_text_encoder_checkpoint_quant_config(model: str) -> "QuantizationConfig | None":
+    """Return the quant config a pre-quantized text encoder ships in ``text_encoder/hf_quant_config.json``.
+
+    The file sits beside ``config.json`` so transformers does not try to apply it.
+    shortcut: local checkpoint folders only; read it through the hub if a published checkpoint needs it.
+    """
+    path = os.path.join(model, "text_encoder", "hf_quant_config.json")
+    if not os.path.isfile(path):
+        return None
+    with open(path) as f:
+        return build_quant_config(json.load(f))
 
 
 # Subtrees of the HF Qwen3-VL text encoder that must stay in checkpoint
@@ -374,7 +387,9 @@ class QwenImage21Pipeline(
         )
         # Unlike the 2.0 T2I pipeline, the vision tower is required: condition
         # images are encoded jointly with the prompt by the VLM.
-        text_encoder_quant_config = _resolve_text_encoder_quant_config(od_config.quantization_config)
+        text_encoder_quant_config = _load_text_encoder_checkpoint_quant_config(model) or (
+            _resolve_text_encoder_quant_config(od_config.quantization_config)
+        )
         if text_encoder_quant_config is None:
             self.text_encoder = from_pretrained_with_prefetch(
                 Qwen3VLForConditionalGeneration.from_pretrained,
@@ -398,10 +413,10 @@ class QwenImage21Pipeline(
             text_encoder_config = AutoConfig.from_pretrained(
                 model, subfolder="text_encoder", local_files_only=local_files_only
             )
-            encoder_od_config = dataclasses.replace(
-                od_config,
-                quantization_config=_exclude_text_encoder_subtrees_from_quant(text_encoder_quant_config),
-            )
+            encoder_quant_config = _exclude_text_encoder_subtrees_from_quant(text_encoder_quant_config)
+            encoder_od_config = dataclasses.replace(od_config, quantization_config=encoder_quant_config)
+            # replace() reruns __post_init__, which puts a pre-quantized transformer's config back.
+            encoder_od_config.quantization_config = encoder_quant_config
             self.text_encoder = create_transformers_model(
                 AutoModelForImageTextToText,
                 encoder_od_config,
