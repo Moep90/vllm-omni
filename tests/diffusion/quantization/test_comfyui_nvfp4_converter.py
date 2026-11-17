@@ -103,14 +103,13 @@ def test_convert_transformer_layout():
         ref = values[m]
         assert ((got - ref).abs() <= ref.abs() * 2**-4 + 1e-6).all()
 
-    # Block 1: to_v is BF16, so to_q/to_k are dequantized exactly and the fused to_qkv stays BF16.
-    for s in ("to_q", "to_k"):
-        m = f"transformer_blocks.1.attn.{s}"
-        assert f"{m}.weight_scale" not in out
-        assert torch.equal(out[f"{m}.weight"], values[m].to(torch.bfloat16))
+    # Block 1: to_v is BF16, so q/k stay NVFP4 with one global scale and only to_v is excluded.
+    assert (
+        out["transformer_blocks.1.attn.to_q.weight_scale_2"].item()
+        == out["transformer_blocks.1.attn.to_k.weight_scale_2"].item()
+        == pytest.approx(0.02)
+    )
     assert set(exclude) == {
-        "transformer_blocks.1.attn.to_q",
-        "transformer_blocks.1.attn.to_k",
         "transformer_blocks.1.attn.to_v",
         "transformer_blocks.0.attn.to_out.0",
         "transformer_blocks.1.attn.to_out.0",
@@ -155,7 +154,10 @@ def test_quant_config_selects_w4a16_and_excludes_runtime_prefixes():
     assert cfg.quant_method == "W4A16_NVFP4"
 
     # Prefixes as QwenImage21Transformer2DModel builds them (default prefix "transformer").
-    assert cfg.is_layer_excluded("transformer.transformer_blocks.1.attn.to_qkv")
+    # Block 1 runs split: q/k fused and quantized, to_v on its own in BF16.
+    assert cfg.is_layer_excluded("transformer.transformer_blocks.1.attn.to_v")
+    assert not cfg.is_layer_excluded("transformer.transformer_blocks.1.attn.to_q")
+    assert not cfg.is_layer_excluded("transformer.transformer_blocks.1.attn.to_qkv")
     assert not cfg.is_layer_excluded("transformer.transformer_blocks.0.attn.to_qkv")
     assert cfg.is_layer_excluded("transformer.transformer_blocks.0.attn.to_out.0")
     assert not cfg.is_layer_excluded("transformer.transformer_blocks.0.img_mlp.proj")
@@ -174,6 +176,7 @@ def test_add_input_scales_uses_runtime_prefixes():
     out, _, _ = conv.convert_transformer(_transformer_sd()[0])
     amax = {
         "transformer.transformer_blocks.0.attn.to_qkv": 3.0,
+        "transformer.transformer_blocks.1.attn.to_qkv": 4.0,
         "transformer.transformer_blocks.0.img_mlp.gate_layer": 5.0,
         "transformer.transformer_blocks.0.img_mlp.proj": 5.0,
         "transformer.transformer_blocks.1.img_mlp.gate_layer": 7.0,
@@ -184,7 +187,9 @@ def test_add_input_scales_uses_runtime_prefixes():
     expected = 3.0 * conv.INPUT_AMAX_MARGIN / 2688
     for s in ("to_q", "to_k", "to_v"):
         assert out[f"transformer_blocks.0.attn.{s}.input_scale"].item() == pytest.approx(expected)
-    # BF16 (dequantized) shards get no input scale.
-    assert "transformer_blocks.1.attn.to_q.input_scale" not in out
+    assert out["transformer_blocks.1.attn.to_k.input_scale"].item() == pytest.approx(
+        4.0 * conv.INPUT_AMAX_MARGIN / 2688
+    )
+    assert "transformer_blocks.1.attn.to_v.input_scale" not in out
     with pytest.raises(ValueError, match="no calibrated input amax"):
         conv.add_input_scales(out, {})

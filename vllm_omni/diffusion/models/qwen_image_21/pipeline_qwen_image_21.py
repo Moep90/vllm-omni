@@ -4,6 +4,7 @@
 
 import copy
 import dataclasses
+import glob
 import json
 import logging
 import os
@@ -20,6 +21,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.utils.torch_utils import randn_tensor
+from safetensors import safe_open
 from torch import nn
 from transformers import AutoConfig, AutoModelForImageTextToText, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -135,6 +137,21 @@ def _load_text_encoder_checkpoint_quant_config(model: str) -> "QuantizationConfi
         return None
     with open(path) as f:
         return build_quant_config(json.load(f))
+
+
+def _text_encoder_ships_vision_tower(model: str) -> bool:
+    """False for a text-to-image-only checkpoint whose text encoder weights omit ``model.visual``.
+
+    shortcut: local checkpoint folders only; hub checkpoints always load the vision tower.
+    """
+    files = glob.glob(os.path.join(model, "text_encoder", "*.safetensors"))
+    if not files:
+        return True
+    for path in files:
+        with safe_open(path, framework="pt") as f:
+            if any(k.startswith("model.visual.") for k in f.keys()):  # noqa: SIM118
+                return True
+    return False
 
 
 # Subtrees of the HF Qwen3-VL text encoder that must stay in checkpoint
@@ -432,6 +449,8 @@ class QwenImage21Pipeline(
             )
         # The pipeline reads hidden states; vocabulary logits are never used.
         self.text_encoder.lm_head = nn.Identity()
+        if not _text_encoder_ships_vision_tower(model):
+            self.text_encoder.model.visual = None
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKLQwenImage21.from_pretrained,
             model,
@@ -679,6 +698,8 @@ class QwenImage21Pipeline(
             "return_tensors": "pt",
         }
         if has_images:
+            if self.text_encoder.model.visual is None:
+                raise ValueError("This checkpoint ships no vision tower; it serves text-to-image requests only.")
             processor_kwargs["images"] = condition_pil_list
         model_inputs = self.processor(**processor_kwargs).to(self.device)
 

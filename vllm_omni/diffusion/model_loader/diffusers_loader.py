@@ -110,6 +110,13 @@ def download_gguf(
 logger = init_logger(__name__)
 
 
+def _device_shares_host_memory() -> bool:
+    """True on integrated GPUs (e.g. GB10), where device allocations come out of host RAM."""
+    return torch.cuda.is_available() and bool(
+        torch.cuda.get_device_properties(torch.accelerator.current_device_index()).is_integrated
+    )
+
+
 def _natural_sort_key(filepath: str) -> list:
     """Natural sort key for filenames with numeric components, e.g.
     model-00001-of-00005.safetensors -> ['model-', 1, '-of-', 5, '.safetensors']."""
@@ -442,6 +449,10 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
+        if use_safetensors and _device_shares_host_memory():
+            # Copying straight from the checkpoint mmap to an integrated GPU kept the touched pages
+            # resident as anonymous memory until the file closed (measured on GB10); a private copy is freed per tensor.
+            weights_iterator = ((name, tensor.clone()) for (name, tensor) in weights_iterator)
         # Apply the prefix.
         prefixed_weights_iterator = ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
         if model is not None:

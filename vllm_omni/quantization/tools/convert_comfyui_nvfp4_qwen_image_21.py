@@ -17,9 +17,10 @@ Layout differences against vLLM-Omni's Qwen-Image-2.1 modules:
   - ComfyUI fuses ``img_mlp.gate_layer`` and ``img_mlp.proj`` into
     ``img_mlp.gate_up`` ([gate; up] rows). It is split back.
   - vLLM-Omni fuses ``to_q/to_k/to_v`` into one ``to_qkv`` linear with one
-    global scale. Blocks where all three are NVFP4 get a shared global scale
-    (block scales re-rounded to FP8). Blocks where any shard is BF16 get the
-    NVFP4 shards dequantized to BF16 and the whole ``to_qkv`` excluded.
+    global scale. Fused shards get a shared global scale (block scales
+    re-rounded to FP8). Blocks with NVFP4 q/k and a BF16 v keep q/k as NVFP4
+    and exclude only to_v, which vLLM-Omni then runs as its own linear.
+    Any other mix is dequantized to BF16 and excluded.
   - The Qwen3-VL text encoder keys move from ``model.layers`` to
     ``model.language_model.layers`` (transformers v5 naming).
 
@@ -172,10 +173,12 @@ def convert_transformer(sd: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Te
     blocks = sorted({m.rsplit(".attn.", 1)[0] for m in linears if m.endswith(QKV_SHARDS)})
     for block in blocks:
         names = [f"{block}.attn.{s}" for s in QKV_SHARDS]
-        if all(n in linears for n in names):
-            shards = [linears.pop(n) for n in names]
+        # All three NVFP4: fused to_qkv. q and k NVFP4 with a BF16 v: the runtime splits off to_v.
+        fused = names if all(n in linears for n in names) else names[:2]
+        if all(n in linears for n in fused):
+            shards = [linears.pop(n) for n in fused]
             worst_scale_err = max(worst_scale_err, share_global_scale(shards))
-            for name, shard in zip(names, shards):
+            for name, shard in zip(fused, shards):
                 _emit(out, name, shard)
         else:
             for name in names:
@@ -264,6 +267,11 @@ def main() -> None:
         "--input-amax",
         help="JSON from calibrate_nvfp4_input_amax.py; makes the transformer W4A4 (NVFP4) instead of W4A16",
     )
+    parser.add_argument(
+        "--text-to-image-only",
+        action="store_true",
+        help="Leave out the vision tower (1.1 GB); the pipeline then rejects image-conditioned requests",
+    )
     args = parser.parse_args()
 
     base, out = pathlib.Path(args.base), pathlib.Path(args.output)
@@ -296,6 +304,9 @@ def main() -> None:
     del tensors
 
     tensors, exclude = convert_text_encoder(_read(args.text_encoder))
+    # The Qwen-Image-2.1 pipeline reads hidden states and never loads lm_head.
+    dropped = ("lm_head.", "model.visual.") if args.text_to_image_only else ("lm_head.",)
+    tensors = {k: v for k, v in tensors.items() if not k.startswith(dropped)}
     _write_component(
         out, base, "text_encoder", "model.safetensors", tensors, quant_config(exclude), "hf_quant_config.json"
     )

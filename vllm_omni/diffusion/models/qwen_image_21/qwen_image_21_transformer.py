@@ -18,6 +18,7 @@ from diffusers.models.normalization import RMSNorm
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -168,6 +169,16 @@ def _resolve_qwen_image21_lookup_name(
             continue
         return lookup_name.replace(weight_name, param_name), shard_id
     return lookup_name, None
+
+
+def _route_split_v_shard(
+    lookup_name: str, shard_id: str | None, params_dict: dict[str, torch.Tensor]
+) -> tuple[str, str | int | None]:
+    """Route a q/k/v shard when `QwenImage21Attention.split_v` holds only q and k in `to_qkv`."""
+    split_v_name = lookup_name.replace(".to_qkv.", ".to_v.")
+    if shard_id is None or split_v_name.rsplit(".", 1)[0] + ".weight" not in params_dict:
+        return lookup_name, shard_id
+    return (split_v_name, None) if shard_id == "v" else (lookup_name, "qk".index(shard_id))
 
 
 def _select_modulation_rows(params: torch.Tensor, target_token_mask: torch.Tensor | None) -> torch.Tensor:
@@ -494,6 +505,9 @@ class QwenImage21Attention(nn.Module):
     4D `attn_mask`) instead of a custom processor.
     """
 
+    # Set in __init__ when to_v is split off; see there.
+    split_v = False
+
     def __init__(
         self,
         dim: int,
@@ -508,16 +522,29 @@ class QwenImage21Attention(nn.Module):
         self.head_dim = dim_head
         self.prefix_kv_cache_dtype = prefix_kv_cache_dtype
 
-        self.to_qkv = QKVParallelLinear(
-            hidden_size=dim,
-            head_size=dim_head,
-            total_num_heads=heads,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.to_qkv",
-        )
-        self.num_heads = self.to_qkv.num_heads
-        self.num_kv_heads = self.to_qkv.num_kv_heads
+        # A pre-quantized checkpoint may keep to_v in full precision while to_q/to_k are quantized
+        # (ComfyUI NVFP4 exports); one fused linear cannot hold both, so to_v gets its own.
+        is_excluded = getattr(quant_config, "is_layer_excluded", None)
+        self.split_v = bool(is_excluded and is_excluded(f"{prefix}.to_v") and not is_excluded(f"{prefix}.to_q"))
+        if self.split_v:
+            self.to_qkv = MergedColumnParallelLinear(
+                dim, [heads * dim_head] * 2, bias=False, quant_config=quant_config, prefix=f"{prefix}.to_qkv"
+            )
+            self.to_v = ColumnParallelLinear(
+                dim, heads * dim_head, bias=False, quant_config=quant_config, prefix=f"{prefix}.to_v"
+            )
+            self.num_heads = self.num_kv_heads = self.to_v.output_size_per_partition // dim_head
+        else:
+            self.to_qkv = QKVParallelLinear(
+                hidden_size=dim,
+                head_size=dim_head,
+                total_num_heads=heads,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_qkv",
+            )
+            self.num_heads = self.to_qkv.num_heads
+            self.num_kv_heads = self.to_qkv.num_kv_heads
 
         # Diffusers normalizes in FP32, then casts before the learned scale.
         # Keep that rounding order for BF16 Q/K; TP shards whole heads.
@@ -649,7 +676,11 @@ class QwenImage21Attention(nn.Module):
         qkv, _ = self.to_qkv(hidden_states)
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
-        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        if self.split_v:
+            query, key = qkv.split([q_size, kv_size], dim=-1)
+            value, _ = self.to_v(hidden_states)
+        else:
+            query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
         query = query.unflatten(-1, (self.num_heads, self.head_dim))
         key = key.unflatten(-1, (self.num_kv_heads, self.head_dim))
@@ -1659,6 +1690,8 @@ class QwenImage21Transformer2DModel(CachedTransformer):
 
             if lookup_name.endswith(".bias") and lookup_name not in params_dict:
                 continue
+
+            lookup_name, shard_id = _route_split_v_shard(lookup_name, shard_id, params_dict)
 
             param = params_dict.get(lookup_name)
             if param is None:
